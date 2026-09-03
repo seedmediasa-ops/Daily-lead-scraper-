@@ -96,39 +96,89 @@ INDUSTRIES = [
 HEADERS = {"User-Agent": "SeedMediaaLeadScraper/1.0 (contact: seedmediaa.co.za)"}
 
 
-def build_query(bbox, osm_key, osm_value, limit):
+def build_combined_query(bbox, industries, limit_per_industry):
+    """
+    Build ONE Overpass query covering every industry for a city, instead of
+    firing one request per industry. This is dramatically more reliable —
+    the free public Overpass server rate-limits/rejects (406) clients that
+    fire many requests in quick succession, which is what a per-industry
+    loop does with 30+ industries.
+    """
     south, west, north, east = bbox
+    clauses = []
+    for osm_key, osm_value, _label in industries:
+        clauses.append(f'  node["{osm_key}"="{osm_value}"]({south},{west},{north},{east});')
+        clauses.append(f'  way["{osm_key}"="{osm_value}"]({south},{west},{north},{east});')
+
+    body = "\n".join(clauses)
+    # out center with no hard cap here — we cap per-industry in Python after
+    # grouping results by which tag matched, so one big union query still
+    # respects --limit per industry.
     return f"""
-    [out:json][timeout:60];
+    [out:json][timeout:180];
     (
-      node["{osm_key}"="{osm_value}"]({south},{west},{north},{east});
-      way["{osm_key}"="{osm_value}"]({south},{west},{north},{east});
+{body}
     );
-    out center {limit};
+    out center;
     """
 
 
-def fetch_industry(city, bbox, osm_key, osm_value, label, limit):
-    query = build_query(bbox, osm_key, osm_value, limit)
-    try:
-        resp = requests.post(OVERPASS_URL, data={"data": query}, headers=HEADERS, timeout=90)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"  [!] {label} in {city}: request failed ({e}) — skipping")
+def classify_industry(tags, industries):
+    """Given an element's tags, find which (osm_key, osm_value) it matched
+    and return the friendly label. Checks in the same order as INDUSTRIES
+    so the first match wins if a place has multiple matching tags."""
+    for osm_key, osm_value, label in industries:
+        if tags.get(osm_key) == osm_value:
+            return label
+    return "Other"
+
+
+def fetch_city_combined(city, bbox, industries, limit_per_industry, max_retries=4):
+    """Fetch all industries for a city in one Overpass request, with retry/
+    backoff on transient errors (406/429/504 are all common on the free
+    public instance under load)."""
+    query = build_combined_query(bbox, industries, limit_per_industry)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(OVERPASS_URL, data={"data": query}, headers=HEADERS, timeout=185)
+            if resp.status_code == 200:
+                break
+            print(f"  [!] {city}: Overpass returned {resp.status_code} "
+                  f"(attempt {attempt}/{max_retries}) — retrying...")
+        except requests.RequestException as e:
+            print(f"  [!] {city}: request failed ({e}) (attempt {attempt}/{max_retries}) — retrying...")
+            resp = None
+
+        if attempt < max_retries:
+            time.sleep(15 * attempt)  # backoff: 15s, 30s, 45s...
+    else:
+        print(f"  [!!] {city}: all {max_retries} attempts failed — skipping this city.")
         return []
 
     try:
         elements = resp.json().get("elements", [])
     except ValueError:
-        print(f"  [!] {label} in {city}: bad response — skipping")
+        print(f"  [!] {city}: bad response body — skipping.")
         return []
 
+    # Group by industry so we can respect limit_per_industry per category
+    per_industry_count = {}
     rows = []
+
     for el in elements:
         tags = el.get("tags", {})
         name = tags.get("name")
         if not name:
-            continue  # skip unnamed entries, no point emailing "Unnamed Business"
+            continue
+
+        label = classify_industry(tags, industries)
+        if label == "Other":
+            continue  # shouldn't happen given our query, but just in case
+
+        if per_industry_count.get(label, 0) >= limit_per_industry:
+            continue
+        per_industry_count[label] = per_industry_count.get(label, 0) + 1
 
         website = tags.get("website") or tags.get("contact:website", "")
         phone = tags.get("phone") or tags.get("contact:phone", "")
@@ -148,14 +198,15 @@ def fetch_industry(city, bbox, osm_key, osm_value, label, limit):
             "Address": address,
             "Website": website,
             "Phone": phone,
-            "Email": email,  # usually blank — OSM rarely has emails; enriched later
+            "Email": email,
             "Email Status": "Found on listing" if email else "",
-            "CEO/Owner Name": "",  # fill manually via LinkedIn/website, as before
+            "CEO/Owner Name": "",
             "Status": "New",
             "Source": "OpenStreetMap",
         })
 
-    print(f"  [OK] {label} in {city}: {len(rows)} businesses found")
+    print(f"  [OK] {city}: {len(rows)} businesses found across "
+          f"{len(per_industry_count)} industries")
     return rows
 
 
@@ -288,13 +339,9 @@ def enrich_with_emails(rows, skip=False):
 
 def scrape_city(city, limit, industries):
     bbox = CITY_BBOX[city]
-    all_rows = []
-    print(f"\nScraping {city.title()} ({len(industries)} industries)...")
-    for osm_key, osm_value, label in industries:
-        rows = fetch_industry(city, bbox, osm_key, osm_value, label, limit)
-        all_rows.extend(rows)
-        time.sleep(2)  # be polite to the free public Overpass server
-    return all_rows
+    print(f"\nScraping {city.title()} ({len(industries)} industries, "
+          f"1 combined request)...")
+    return fetch_city_combined(city, bbox, industries, limit)
 
 
 def dedupe(rows):
@@ -340,13 +387,17 @@ def main():
     cities = ["durban", "johannesburg"] if args.city == "both" else [args.city]
 
     all_rows = []
-    for city in cities:
+    for i, city in enumerate(cities):
         all_rows.extend(scrape_city(city, args.limit, industries))
+        if i < len(cities) - 1:
+            time.sleep(10)  # be polite between the two city requests
 
     all_rows = dedupe(all_rows)
 
     if not all_rows:
-        print("\nNo leads found. Overpass may be rate-limiting — try again in a few minutes.")
+        print("\nNo leads found from either city. Overpass may be down or "
+              "heavily rate-limited right now — this run produced nothing, "
+              "try again later (the next scheduled run will retry automatically).")
         sys.exit(0)
 
     all_rows = enrich_with_emails(all_rows, skip=args.no_email_lookup)
