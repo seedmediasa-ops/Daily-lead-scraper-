@@ -11,7 +11,7 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
@@ -19,7 +19,7 @@ jobs:
         python-version: '3.11'
     - run: pip install -r requirements.txt
     - name: Scrape Durban and Johannesburg (OpenStreetMap, no API key needed)
-      run: python seedmediaa_scraper.py --city both --all --limit 30
+      run: python seedmediaa_scraper.py --city both --all --limit 50
     - name: Commit results
       run: |
         git config --local user.email "action@github.com"
