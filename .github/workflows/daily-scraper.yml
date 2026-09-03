@@ -1,0 +1,31 @@
+name: Daily Lead Scraper
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - run: pip install -r requirements.txt
+    - name: Scrape Durban
+      env:
+        GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+      run: python seedmediaa_scraper.py --city durban --all --limit 30
+    - name: Scrape Johannesburg
+      env:
+        GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+      run: python seedmediaa_scraper.py --city johannesburg --all --limit 30
+    - name: Commit results
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add leads_output/
+        git diff --staged --quiet || git commit -m "Daily leads: $(date +%Y-%m-%d)"
+        git push
